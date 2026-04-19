@@ -84,6 +84,15 @@ async def _get_my_peer_name() -> str:
     return _cached_peer_name
 
 
+def _detect_backend() -> str:
+    """Detect which agent runtime is hosting this MCP server."""
+    if os.environ.get("GEMINI_CLI"):
+        return "gemini"
+    if ".codex/" in os.environ.get("PATH", ""):
+        return "codex"
+    return os.environ.get("REPOWIRE_BACKEND", "claude-code")
+
+
 async def _ensure_registered() -> None:
     """Lazy-register this peer with the daemon on first MCP tool use.
 
@@ -116,17 +125,40 @@ async def _ensure_registered() -> None:
         except Exception:
             pass
 
-    # Detect backend from env set by each agent runtime
-    if os.environ.get("GEMINI_CLI"):
-        backend = "gemini"
-    elif ".codex/" in os.environ.get("PATH", ""):
-        backend = "codex"
-    else:
-        backend = os.environ.get("REPOWIRE_BACKEND", "claude-code")
+    backend = _detect_backend()
+
+    try:
+        cwd = Path.cwd()
+    except OSError as e:
+        logger.warning("Cannot resolve cwd for MCP registration: %s", e)
+        return
+
+    # Last-resort identity resolution: find hook-registered peer by path+backend.
+    # Avoids creating a duplicate when MCP subprocess lacks tmux env vars.
+    try:
+        result = await daemon_request("GET", "/peers", params={
+            "path": str(cwd),
+            "backend": backend,
+            "status": "online",
+        })
+        candidates = result.get("peers", [])
+        if candidates:
+            candidates.sort(
+                key=lambda p: (bool(p.get("tmux_session")), p.get("last_seen") or ""),
+                reverse=True,
+            )
+            assigned = candidates[0].get("display_name")
+            if assigned:
+                _cached_peer_name = assigned
+                _registered = True
+                return
+    except (DaemonConnectionError, DaemonHTTPError, DaemonTimeoutError) as e:
+        logger.debug("Path+backend peer lookup failed: %s", e)
+
     try:
         body: dict = {
-            "name": Path.cwd().name,
-            "path": str(Path.cwd()),
+            "name": cwd.name or "root",
+            "path": str(cwd),
             "circle": tmux_info["session_name"] or "default",
             "backend": backend,
         }
