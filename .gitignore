@@ -22,3 +22,8 @@ session-logs.md
 # Dashboard build output (run 'repowire build-ui' before 'uv build')
 web/out/
 .coverage
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
