@@ -231,6 +231,16 @@ Use `.claude/memory/MEMORY.md` as the index. One file per memory, frontmatter fo
 - Mock `subprocess.Popen` in session handler tests to prevent ws-hook leaking to live daemon
 - 231 tests covering routes, WebSocket, auth, query tracker, hooks, config, transcript
 
+## Knowledge Graph
+
+A graphify knowledge graph lives in `graphify-out/`. After significant code changes, run:
+
+```bash
+/graphify . --update   # incremental re-extraction (only changed files)
+```
+
+The graph covers 133 files, 1864 nodes, 5455 edges across the full codebase. Key god nodes: `AgentType`, `Config`, `PeerRegistry`, `MessageRouter`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 
