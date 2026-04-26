@@ -1,7 +1,8 @@
 """Telegram bot peer for the repowire mesh.
 
 Bridges Telegram <> repowire: notifications become Telegram messages,
-Telegram messages become peer notifications. Inline buttons for quick actions.
+Telegram messages become peer notifications. A persistent ReplyKeyboard
+below the compose bar lets the user switch target peers with one tap.
 
 Usage:
     TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... repowire telegram start
@@ -14,6 +15,9 @@ import json
 import logging
 import os
 import re
+import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -27,6 +31,16 @@ from repowire.config.models import DEFAULT_DAEMON_URL
 logger = logging.getLogger(__name__)
 
 _MD_ESCAPE_RE = re.compile(r"([_*\[\]()~`>#+=|{}.!\-])")
+
+# Reply-keyboard button markers. Each label is `<marker> <peer_name>`.
+CURRENT_MARK = "✦"        # currently selected target
+CURRENT_OFF_MARK = "✧"    # currently selected target but peer is offline
+RECENT_MARK = "💬"        # recent notifier
+MORE_LABEL = "… more"     # open full picker
+PEERS_LABEL = "📋 peers"
+CLEAR_LABEL = "❌ clear"
+RETRY_WINDOW_S = 60.0     # pending-retry TTL after a failed send
+PEERS_CACHE_TTL_S = 5.0   # short-lived cache for /peers fetch
 
 
 def _esc(text: str) -> str:
@@ -45,6 +59,128 @@ def _ws_url(http_url: str) -> str:
     """Convert http(s) URL to ws(s)."""
     p = urlparse(http_url)
     return urlunparse(p._replace(scheme="wss" if p.scheme == "https" else "ws"))
+
+
+# -- Pure helpers (unit-testable without Telegram/daemon) --
+
+
+@dataclass
+class PendingRetry:
+    text: str
+    expires_at: float
+
+    def is_active(self, now: float) -> bool:
+        return now < self.expires_at
+
+
+def compute_visible_recents(
+    recents: list[str],
+    online: set[str],
+    current: str | None,
+    limit: int = 5,
+) -> list[str]:
+    """Return recents filtered to online peers, dedup'd, current excluded.
+
+    Preserves the newest-first order of `recents`.
+    """
+    seen: set[str] = set()
+    if current:
+        seen.add(current)
+    out: list[str] = []
+    for name in recents:
+        if name in seen:
+            continue
+        if name not in online:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def build_reply_keyboard(
+    current: str | None,
+    recents: list[str],
+    online: set[str],
+    pending_retry_text: str | None = None,
+) -> dict:
+    """Build the persistent ReplyKeyboardMarkup.
+
+    Layout (up to 6 peer slots + commands):
+        row 1: current (✦/✧) + 2 recents
+        row 2: 3 more recents (or more-picker)
+        row 3: 📋 peers · ❌ clear · … more
+
+    Placeholder reflects retry state, then current target, then no-peer.
+    """
+    visible = compute_visible_recents(recents, online, current, limit=5)
+
+    peer_buttons: list[str] = []
+    if current:
+        mark = CURRENT_MARK if current in online else CURRENT_OFF_MARK
+        peer_buttons.append(f"{mark} {current}")
+    peer_buttons.extend(f"{RECENT_MARK} {name}" for name in visible)
+
+    # Split into two rows of up to 3 buttons each.
+    row1 = [{"text": t} for t in peer_buttons[:3]]
+    row2 = [{"text": t} for t in peer_buttons[3:6]]
+
+    keyboard: list[list[dict[str, str]]] = []
+    if row1:
+        keyboard.append(row1)
+    if row2:
+        keyboard.append(row2)
+    keyboard.append([
+        {"text": PEERS_LABEL},
+        {"text": CLEAR_LABEL},
+        {"text": MORE_LABEL},
+    ])
+
+    if pending_retry_text is not None:
+        preview = (
+            pending_retry_text
+            if len(pending_retry_text) <= 24
+            else pending_retry_text[:21] + "…"
+        )
+        placeholder = f'retry "{preview}" · tap peer to send'
+    elif current:
+        suffix = " (offline)" if current not in online else ""
+        placeholder = f"msg @{current}{suffix}..."
+    else:
+        placeholder = "No active peer · tap to select"
+
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": placeholder,
+    }
+
+
+def parse_keyboard_tap(text: str) -> tuple[str, str | None]:
+    """Classify a free-text message as a keyboard tap or plain text.
+
+    Returns (kind, arg) where kind is one of:
+        "select"  → arg is peer name (✦/✧/💬 <name>)
+        "peers"   → arg is None (📋 peers tapped)
+        "clear"   → arg is None
+        "more"    → arg is None (… more tapped)
+        "text"    → arg is None (plain user text, not a tap)
+    """
+    if text == PEERS_LABEL:
+        return ("peers", None)
+    if text == CLEAR_LABEL:
+        return ("clear", None)
+    if text == MORE_LABEL:
+        return ("more", None)
+    for marker in (CURRENT_MARK, CURRENT_OFF_MARK, RECENT_MARK):
+        prefix = marker + " "
+        if text.startswith(prefix):
+            name = text[len(prefix):].strip()
+            if name:
+                return ("select", name)
+    return ("text", None)
 
 
 class TelegramPeer:
@@ -69,6 +205,11 @@ class TelegramPeer:
         self._tg_offset = 0
         self._reply_target: str | None = None  # peer to send next message to
         self._task: asyncio.Task[None] | None = None
+        self._recents: deque[str] = deque(maxlen=10)
+        self._pending_retry: PendingRetry | None = None
+        self._keyboard_enabled: bool = True
+        self._peers_cache: list[dict] | None = None
+        self._peers_cache_at: float = 0.0
 
     async def _run(self) -> None:
         await asyncio.gather(self._ws_loop(), self._poll_loop())
@@ -134,13 +275,24 @@ class TelegramPeer:
         text = msg.get("text", "")
 
         if t == "notify":
+            self._touch_recent(who)
             await self._tg_send(f"*@{_esc(who)}*\n{_esc(text)}")
         elif t == "query":
+            self._touch_recent(who)
             await self._tg_send(f"❓ *@{_esc(who)}*\n{_esc(text)}")
         elif t == "broadcast":
+            self._touch_recent(who)
             await self._tg_send(f"📢 *@{_esc(who)}*\n{_esc(text)}")
         elif t == "ping" and self._ws:
             await self._ws.send(json.dumps({"type": "pong"}))
+
+    def _touch_recent(self, peer: str) -> None:
+        """Move peer to front of recents; dedup."""
+        try:
+            self._recents.remove(peer)
+        except ValueError:
+            pass
+        self._recents.appendleft(peer)
 
     # -- Telegram polling --
 
@@ -195,54 +347,107 @@ class TelegramPeer:
 
         if data.startswith(("target:", "notify:")):
             peer = data.split(":", 1)[1]
-            self._reply_target = peer
-            await self._tg_send(
-                f"Now talking to *@{_esc(peer)}*\\. All messages go there\\.",
-                _kb([[("📋 Peers", "peers"), ("❌ Clear", "cancel")]]),
-            )
+            await self._select_peer(peer)
         elif data == "cancel":
             self._reply_target = None
+            self._pending_retry = None
             await self._tg_send("Cancelled\\.")
         elif data == "peers":
             await self._cmd_peers()
 
     async def _on_text(self, text: str, message_id: int | None = None) -> None:
-        # Commands
+        # Reply-keyboard taps
+        kind, arg = parse_keyboard_tap(text)
+        if kind == "select" and arg:
+            await self._select_peer(arg, message_id=message_id, trigger_retry=True)
+            return
+        if kind == "peers":
+            await self._cmd_peers()
+            return
+        if kind == "clear":
+            self._reply_target = None
+            self._pending_retry = None
+            await self._tg_send("Cleared\\. No active conversation\\.")
+            return
+        if kind == "more":
+            await self._cmd_peers()
+            return
+
+        # Slash commands
         if text in ("/start", "/peers", "/list"):
             await self._cmd_peers()
             return
         if text == "/clear":
             self._reply_target = None
+            self._pending_retry = None
             await self._tg_send("Cleared\\. No active conversation\\.")
+            return
+        if text == "/keyboard off":
+            self._keyboard_enabled = False
+            await self._http.post(
+                f"{self._bot_path}/sendMessage",
+                json={
+                    "chat_id": self._chat_id,
+                    "text": "Keyboard hidden\\. Use `/keyboard on` to restore\\.",
+                    "parse_mode": "MarkdownV2",
+                    "reply_markup": {"remove_keyboard": True},
+                },
+            )
+            return
+        if text == "/keyboard on":
+            self._keyboard_enabled = True
+            await self._tg_send("Keyboard restored\\.")
             return
         if text.startswith("/switch ") or text.startswith("/select "):
             peer = text.split(maxsplit=1)[1].strip().lstrip("@")
-            self._reply_target = peer
-            await self._tg_send(
-                f"Now talking to *@{_esc(peer)}*\\. All messages go there\\.",
-                _kb([[("📋 Peers", "peers"), ("❌ Clear", "cancel")]]),
-            )
+            await self._select_peer(peer, message_id=message_id)
             return
 
         # @peer message — explicit target (also sets sticky)
         m = re.match(r"^@(\S+)\s+(.+)", text, re.DOTALL)
         if m:
             self._reply_target = m.group(1)
+            self._pending_retry = None  # typing cancels retry
             await self._notify(m.group(1), m.group(2), message_id=message_id)
             return
 
         # Sticky conversation — send to current peer
         if self._reply_target:
+            self._pending_retry = None  # typing cancels retry
             await self._notify(self._reply_target, text, message_id=message_id)
             return
 
         # No conversation active
+        self._pending_retry = None
         await self._tg_send(
             "No active conversation\\.\n\n"
             "`/peers` — list peers\n"
             "`/select name` — start conversation\n"
             "`@name msg` — quick message"
         )
+
+    async def _select_peer(
+        self,
+        peer: str,
+        message_id: int | None = None,
+        trigger_retry: bool = False,
+    ) -> None:
+        """Switch target peer. If trigger_retry and a retry is pending, replay it.
+
+        Retry replay is opt-in (only keyboard taps set trigger_retry=True) so
+        that slash commands like /switch don't surprise the user by resending.
+        """
+        peer = peer.lstrip("@")
+        retry = self._pending_retry
+        if trigger_retry and retry and retry.is_active(time.monotonic()):
+            self._reply_target = peer
+            self._pending_retry = None
+            await self._notify(peer, retry.text, message_id=message_id)
+            return
+
+        self._reply_target = peer
+        self._pending_retry = None
+        await self._tg_send(f"Now talking to *@{_esc(peer)}*\\.")
 
     async def _on_photo(self, photo: dict, caption: str, message_id: int | None = None) -> None:
         """Handle incoming Telegram photo — upload to daemon, notify peer."""
@@ -294,37 +499,63 @@ class TelegramPeer:
 
     # -- Commands --
 
-    async def _cmd_peers(self) -> None:
+    async def _fetch_online_peers(self, *, use_cache: bool = True) -> list[dict]:
+        """Fetch current peers from daemon. Empty list on failure.
+
+        Caches for PEERS_CACHE_TTL_S to avoid hammering the daemon when
+        many bot messages fire in quick succession (each rebuilds the
+        keyboard). Pass use_cache=False for user-driven listings.
+        """
+        now = time.monotonic()
+        if (
+            use_cache
+            and self._peers_cache is not None
+            and now - self._peers_cache_at < PEERS_CACHE_TTL_S
+        ):
+            return self._peers_cache
         try:
             r = await self._http.get(f"{self._daemon_url}/peers")
             peers = r.json().get("peers", [])
-            active = [p for p in peers if p.get("status") in ("online", "busy")]
+            self._peers_cache = peers
+            self._peers_cache_at = now
+            return peers
+        except Exception:
+            logger.warning("Failed to fetch peers", exc_info=True)
+            return []
 
-            if not active:
-                await self._tg_send("No peers online\\.")
-                return
+    async def _cmd_peers(self) -> None:
+        peers = await self._fetch_online_peers(use_cache=False)
+        active = [p for p in peers if p.get("status") in ("online", "busy")]
 
-            lines = []
-            buttons = []
-            for p in active:
-                name = p.get("display_name", p.get("name", "?"))
-                path = p.get("path", "")
-                folder = Path(path).name or name
-                desc = p.get("description", "")
-                branch = p.get("metadata", {}).get("branch", "")
-                icon = "🟢" if p.get("status") == "online" else "🟡"
+        if not active:
+            await self._tg_send("No peers online\\.")
+            return
 
-                line = f"{icon} *{_esc(folder)}* `{_esc(name)}`"
-                if branch:
-                    line += f" `{_esc(branch)}`"
-                if desc:
-                    line += f"\n  _{_esc(desc)}_"
-                lines.append(line)
-                buttons.append([("💬 " + folder, f"target:{name}")])
+        lines = []
+        buttons = []
+        for p in active:
+            name = p.get("display_name", p.get("name", "?"))
+            path = p.get("path", "")
+            folder = Path(path).name or name
+            desc = p.get("description", "")
+            branch = p.get("metadata", {}).get("branch", "")
+            icon = "🟢" if p.get("status") == "online" else "🟡"
 
-            await self._tg_send("\n".join(lines), _kb(buttons))
-        except Exception as e:
-            await self._tg_send(f"Error: {_esc(str(e))}")
+            line = f"{icon} *{_esc(folder)}* `{_esc(name)}`"
+            if branch:
+                line += f" `{_esc(branch)}`"
+            if desc:
+                line += f"\n  _{_esc(desc)}_"
+            lines.append(line)
+            buttons.append(("💬 " + folder, f"target:{name}"))
+
+        # 2-column grid when >4 peers; 1-column otherwise.
+        if len(buttons) > 4:
+            rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        else:
+            rows = [[b] for b in buttons]
+
+        await self._tg_send("\n".join(lines), markup=_kb(rows))
 
     async def _notify(self, peer: str, message: str, message_id: int | None = None) -> None:
         try:
@@ -342,9 +573,23 @@ class TelegramPeer:
                 # No text reply on success — reaction is the confirmation
             else:
                 detail = r.json().get("detail", r.text)
-                await self._tg_send(f"✗ {_esc(str(detail))}")
+                self._pending_retry = PendingRetry(
+                    text=message,
+                    expires_at=time.monotonic() + RETRY_WINDOW_S,
+                )
+                await self._tg_send(
+                    f"✗ Couldn't reach *@{_esc(peer)}*: {_esc(str(detail))}\n"
+                    f"Tap a peer to resend, or type a new message to cancel\\."
+                )
         except Exception as e:
-            await self._tg_send(f"Error: {_esc(str(e))}")
+            self._pending_retry = PendingRetry(
+                text=message,
+                expires_at=time.monotonic() + RETRY_WINDOW_S,
+            )
+            await self._tg_send(
+                f"⚠️ Daemon unreachable: {_esc(str(e))}\n"
+                f"Tap a peer to retry, or type a new message to cancel\\."
+            )
 
     # -- Telegram API --
 
@@ -369,11 +614,34 @@ class TelegramPeer:
                 "text": text,
                 "parse_mode": "MarkdownV2",
             }
-            if markup:
+            if markup is not None:
                 payload["reply_markup"] = markup
+            elif self._keyboard_enabled:
+                payload["reply_markup"] = await self._current_reply_keyboard()
             await self._http.post(f"{self._bot_path}/sendMessage", json=payload)
         except Exception:
             logger.warning("Telegram send failed", exc_info=True)
+
+    async def _current_reply_keyboard(self) -> dict:
+        """Build the persistent keyboard from fresh peer data."""
+        peers = await self._fetch_online_peers()
+        online = {
+            p.get("display_name", p.get("name", ""))
+            for p in peers
+            if p.get("status") in ("online", "busy")
+        }
+        online.discard("")
+        pending = (
+            self._pending_retry.text
+            if self._pending_retry and self._pending_retry.is_active(time.monotonic())
+            else None
+        )
+        return build_reply_keyboard(
+            current=self._reply_target,
+            recents=list(self._recents),
+            online=online,
+            pending_retry_text=pending,
+        )
 
 
 def main() -> None:
