@@ -36,9 +36,7 @@ Repowire is a phone call (real-time, ephemeral). Gastown is email + project mana
 
 </details>
 
-
-https://github.com/user-attachments/assets/e356ce7c-9454-4e41-93af-3991c6f391b9
-
+https://github.com/user-attachments/assets/3755328a-e38a-45fb-b465-34526afbe44a
 
 ## Installation
 
