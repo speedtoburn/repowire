@@ -9,14 +9,11 @@ from pydantic import BaseModel, Field
 
 from repowire.config.models import AgentType
 from repowire.daemon.auth import require_auth
-from repowire.daemon.deps import get_config
+from repowire.daemon.deps import get_config, get_peer_registry
+from repowire.daemon.peer_registry import PeerRegistry
 from repowire.spawn import SpawnConfig, SpawnResult, kill_peer, spawn_peer
 
 router = APIRouter(tags=["spawn"])
-
-# In-memory registry of tmux_sessions spawned by this daemon instance.
-# Only sessions in this set can be killed via /kill.
-_spawned_sessions: set[str] = set()
 
 
 class SpawnConfigResponse(BaseModel):
@@ -58,18 +55,24 @@ class SpawnResponse(BaseModel):
     tmux_session: str
 
 
-class KillRequest(BaseModel):
-    """Request to kill a spawned session."""
-
-    tmux_session: str = Field(
-        ..., description="Session ref returned by /spawn (e.g. 'default:myproject')"
-    )
-
-
 class KillResponse(BaseModel):
     """Result of a successful kill."""
 
     ok: bool = True
+
+
+class KillPeerRequest(BaseModel):
+    """Request to kill a registered peer by mesh identity."""
+
+    peer_identifier: str = Field(..., description="Peer ID or display name from /peers")
+    circle: str | None = Field(None, description="Circle to scope display-name lookup")
+    from_peer: str | None = Field(
+        None, description="Caller peer_id or display_name — used for role-based authorization"
+    )
+
+
+async def _authorize_kill(registry: PeerRegistry, from_peer: str | None) -> None:
+    """Hook for future role-based authorization (e.g. orchestrator-only kill)."""
 
 
 def _validate_spawn_request(path: str, command: str) -> None:
@@ -137,31 +140,50 @@ async def spawn(
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    _spawned_sessions.add(result.tmux_session)
     return SpawnResponse(display_name=result.display_name, tmux_session=result.tmux_session)
 
 
-@router.post("/kill", response_model=KillResponse)
-async def kill(
-    request: KillRequest,
+@router.post("/kill-peer", response_model=KillResponse)
+async def kill_registered_peer(
+    request: KillPeerRequest,
     _: str | None = Depends(require_auth),
 ) -> KillResponse:
-    """Kill a spawned agent session.
+    """Kill a registered local peer by peer_id or display_name.
 
-    Only sessions previously spawned via /spawn on this daemon instance can be killed.
+    Resolves mesh identity via PeerRegistry so callers do not need to know the
+    tmux window name.
     """
-    if request.tmux_session not in _spawned_sessions:
+    peer_registry = get_peer_registry()
+    await peer_registry.lazy_repair()
+    await _authorize_kill(peer_registry, request.from_peer)
+    resolved = await peer_registry.resolve_peer_strict(
+        request.peer_identifier, circle=request.circle,
+    )
+
+    if isinstance(resolved, list):
+        if not resolved:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Peer not found: {request.peer_identifier}",
+            )
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session not found or not spawned by repowire: {request.tmux_session}",
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": f"Ambiguous peer identifier: {request.peer_identifier}",
+                "candidates": [
+                    {
+                        "peer_id": p.peer_id,
+                        "display_name": p.display_name,
+                        "circle": p.circle,
+                        "tmux_session": p.tmux_session,
+                    }
+                    for p in resolved
+                ],
+            },
         )
 
-    ok = kill_peer(request.tmux_session)
-    if not ok:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tmux session not found: {request.tmux_session}",
-        )
-
-    _spawned_sessions.discard(request.tmux_session)
+    peer = resolved
+    if peer.tmux_session:
+        kill_peer(peer.tmux_session)
+    await peer_registry.unregister_peer(peer.peer_id)
     return KillResponse()
