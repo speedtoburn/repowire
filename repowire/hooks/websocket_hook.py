@@ -185,6 +185,9 @@ def _build_ps_child_map() -> tuple[dict[int, list[int]], dict[int, str]] | None:
     return children, pid_to_comm
 
 
+_SHELL_COMMS = frozenset({"bash", "zsh", "sh", "fish", "tcsh", "csh", "dash", "login"})
+
+
 def _find_agent_in_subtree(
     root_pid: int,
     expected: str,
@@ -208,6 +211,40 @@ def _find_agent_in_subtree(
         seen.add(pid)
         if pid_to_comm.get(pid) == target:
             return pid
+        for child_pid in children.get(pid, []):
+            queue.append(child_pid)
+    return None
+
+
+def _capture_baseline_from_subtree(
+    root_pid: int,
+    children: dict[int, list[int]],
+    pid_to_comm: dict[int, str],
+) -> str | None:
+    """BFS the pane's subtree from `root_pid`, return first non-shell comm.
+
+    Used at hook startup to capture a stable agent baseline that doesn't depend
+    on tmux's `pane_current_command`. Tmux reads the kernel's exec name (ucomm),
+    while `ps -axo comm` reads BSD comm/argv[0]; these can disagree when an
+    agent ships as a per-version binary (e.g. Claude Code v2.1.138 installs at
+    ~/.local/share/claude/versions/2.1.138 with a `claude` symlink). Both
+    startup and steady-state safety checks must read from the same source —
+    `ps -axo comm` — so the baseline is captured here rather than from tmux.
+
+    Returns None if the subtree contains only shell processes (rare: SessionStart
+    fired before the agent process exists yet). Caller falls back to the
+    historic shell-denylist on the foreground command in that case.
+    """
+    seen: set[int] = set()
+    queue: list[int] = [root_pid]
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        comm = pid_to_comm.get(pid)
+        if comm and comm not in _SHELL_COMMS:
+            return comm
         for child_pid in children.get(pid, []):
             queue.append(child_pid)
     return None
@@ -409,19 +446,26 @@ async def main() -> int:
         backend = AgentType.CLAUDE_CODE
     path = str(os.getcwd())
 
-    # Snapshot pane command at startup to detect pane reuse
+    # Snapshot pane command at startup to detect pane reuse. Derive from a
+    # subtree walk rather than tmux's pane_current_command so the baseline
+    # matches what `ps -axo comm` reports during steady-state safety checks
+    # (see _capture_baseline_from_subtree for why these can disagree).
     global _expected_command, _cached_agent_pid
-    _expected_command = _get_pane_command(pane_id)
-    # Pre-populate the cached agent PID so the steady-state safety check is
-    # os.kill(pid, 0). Failure here is fine — _is_pane_safe will rebuild on demand.
-    if _expected_command:
-        pane_pid = _get_pane_pid(pane_id)
-        ps_result = _build_ps_child_map() if pane_pid is not None else None
-        if pane_pid is not None and ps_result is not None:
-            children, pid_to_comm = ps_result
+    pane_pid = _get_pane_pid(pane_id)
+    ps_result = _build_ps_child_map() if pane_pid is not None else None
+    if pane_pid is not None and ps_result is not None:
+        children, pid_to_comm = ps_result
+        _expected_command = _capture_baseline_from_subtree(pane_pid, children, pid_to_comm)
+        if _expected_command:
             _cached_agent_pid = _find_agent_in_subtree(
                 pane_pid, _expected_command, children, pid_to_comm,
             )
+    if _expected_command is None:
+        # Fallback: no agent process found in the subtree yet (SessionStart
+        # may have fired before the agent finished spawning). The
+        # foreground-command shell-denylist path in _is_pane_safe will handle
+        # it from here.
+        _expected_command = _get_pane_command(pane_id)
 
     daemon_host = os.environ.get("REPOWIRE_DAEMON_HOST", "127.0.0.1")
     daemon_port = os.environ.get("REPOWIRE_DAEMON_PORT", "8377")

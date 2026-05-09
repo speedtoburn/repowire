@@ -329,6 +329,37 @@ class TestIsPaneSafeSubtree:
         assert websocket_hook._cached_agent_pid is None
 
 
+class TestCaptureBaselineFromSubtree:
+    """Startup baseline comes from `ps -axo comm` (same source as steady-state
+    safety) instead of tmux `pane_current_command`. Guards against agents
+    shipping as per-version binaries (Claude v2.1.138+) where tmux reports the
+    version string but ps reports the agent name."""
+
+    def test_returns_first_non_shell_descendant(self):
+        capture = websocket_hook._capture_baseline_from_subtree
+
+        # finds agent past shell parent, before transient subprocess
+        assert capture(
+            200, {200: [300], 300: [400]}, {200: "zsh", 300: "claude", 400: "git"},
+        ) == "claude"
+
+        # only shells: nothing to baseline against
+        assert capture(200, {200: [201]}, {200: "zsh", 201: "bash"}) is None
+
+        # exec'd-into-pane: agent IS the pane_pid, no shell parent
+        assert capture(200, {}, {200: "claude"}) == "claude"
+
+        # agent reports versioned binary name (Claude v2.1.138 case)
+        assert capture(
+            200, {200: [300]}, {200: "zsh", 300: "2.1.138"},
+        ) == "2.1.138"
+
+        # skips multiple shell layers (login → fish → claude)
+        assert capture(
+            100, {100: [200], 200: [300]}, {100: "login", 200: "fish", 300: "claude"},
+        ) == "claude"
+
+
 class TestPingHandlerThreshold:
     """The ping handler must tolerate transient unsafe results before exiting."""
 
