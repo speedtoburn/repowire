@@ -18,7 +18,6 @@ from repowire.spawn import (
     SpawnConfig,
     SpawnResult,
     kill_pane,
-    kill_peer,
     spawn_peer,
 )
 
@@ -29,6 +28,28 @@ _COMMAND_TO_BACKEND: dict[str, AgentType] = {
 # Strong references to background warmup tasks. asyncio holds only weak refs to
 # tasks, so without this set a long-sleeping warmup can be GC'd mid-flight.
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+# Pane ids of peers spawned via /spawn. Used by /kill-peer to gate tmux pane
+# kills: only panes the daemon spawned should be killed. The OpenCode plugin
+# sends tmux_session from any user-attached pane, so tmux_session alone is not
+# a daemon-spawn signal.
+#
+# Lifecycle assumptions:
+# - Lost on daemon restart → /kill-peer safe-fails to tmux_killed=None
+# - Cleared on pane_died lifecycle event (see lifecycle_handler.handle_pane_died)
+#   to prevent stale entries from matching a reused pane id after a tmux server
+#   restart. Tmux pane ids are session-lifetime unique within a server, so this
+#   set is only safe for the current tmux server's lifetime.
+_SPAWNED_PANE_IDS: set[str] = set()
+
+
+def forget_spawned_pane(pane_id: str) -> None:
+    """Remove a pane id from the spawned set (called on pane_died lifecycle).
+
+    Idempotent. Used by daemon.lifecycle_handler to prevent stale entries
+    from matching reused pane ids after a tmux server restart.
+    """
+    _SPAWNED_PANE_IDS.discard(pane_id)
 
 
 def _backend_from_command(command: str) -> AgentType:
@@ -90,9 +111,14 @@ class KillResponse(BaseModel):
     """Result of a successful kill.
 
     `tmux_killed` reports whether the underlying tmux pane was terminated:
-    - True  → daemon-spawned peer, pane killed successfully
-    - False → daemon-spawned peer, but tmux kill failed (orphan pane likely)
-    - None  → externally-attached peer; daemon does not own its pane
+    - True  → pane kill attempted and succeeded
+    - False → pane kill attempted but failed (likely orphan pane already gone;
+              caller should verify with `tmux list-panes -a`)
+    - None  → pane kill skipped because daemon ownership was not proven.
+              Causes: peer was externally attached (no /spawn), peer had no
+              pane_id, or daemon restarted since /spawn (in-memory ownership
+              set was lost). Caller can verify with `tmux list-panes` and
+              follow up with manual `tmux kill-pane` if needed.
     """
 
     ok: bool = True
@@ -182,6 +208,12 @@ async def spawn(
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+    # Record that we own this pane so /kill-peer can safely kill it later.
+    # Externally-attached agents (notably OpenCode) also report tmux_session,
+    # so tmux_session alone is NOT a daemon-spawn signal — pane_id ownership is.
+    if result.pane_id:
+        _SPAWNED_PANE_IDS.add(result.pane_id)
+
     # Schedule post-spawn warmup in the background -- the codex case sleeps
     # ~10s and would otherwise stall the /spawn response. claude/opencode/gemini
     # warmups are no-ops and return immediately. Hold a strong ref to the task
@@ -242,15 +274,14 @@ async def kill_registered_peer(
         )
 
     peer = resolved
-    # Only daemon-spawned peers populate tmux_session (SessionStart hook omits
-    # it). Use that as the gate so we never kill panes we don't own. Prefer
-    # pane_id for the actual kill — it's stable across window renames, while
-    # tmux_session is window-name based and silently fails after a rename.
+    # Only kill the pane if the daemon spawned it. We track spawned pane_ids
+    # in _SPAWNED_PANE_IDS at /spawn time. tmux_session is NOT a reliable
+    # ownership signal — the OpenCode plugin sends it from any user-attached
+    # pane (installers/opencode.py:213-216), and any HTTP /peers caller could
+    # too. Pane-id-set membership is the single source of truth.
     tmux_killed: bool | None = None
-    if peer.tmux_session:
-        if peer.pane_id:
-            tmux_killed = kill_pane(peer.pane_id)
-        else:
-            tmux_killed = kill_peer(peer.tmux_session)
+    if peer.pane_id and peer.pane_id in _SPAWNED_PANE_IDS:
+        tmux_killed = kill_pane(peer.pane_id)
+        _SPAWNED_PANE_IDS.discard(peer.pane_id)
     await peer_registry.unregister_peer(peer.peer_id)
     return KillResponse(tmux_killed=tmux_killed)
