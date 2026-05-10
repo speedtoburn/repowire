@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -728,3 +729,135 @@ class TestEagerMcpRegistration:
             await mcp_server.run_mcp_server()
 
         assert stdio_called is True
+
+
+class TestCodexEagerWsHookSpawn:
+    """Codex MCP eager registration must spawn ws-hook when the spawn hint
+    anchors it to a tmux pane. Without this, codex peers register but have
+    no inbound transport — notify_peer would 500 with "No connection for
+    session X".
+    """
+
+    @pytest.mark.asyncio
+    @patch("repowire.mcp.server._spawn_ws_hook_for_pane")
+    @patch("repowire.mcp.server._get_my_peer_name", new_callable=AsyncMock)
+    @patch("repowire.mcp.server.daemon_request", new_callable=AsyncMock)
+    @patch(
+        "repowire.mcp.server.get_tmux_info",
+        return_value={"pane_id": None, "session_name": None, "window_name": None},
+    )
+    @patch("repowire.mcp.server.consume_hint")
+    async def test_codex_eager_register_spawns_ws_hook_when_hint_has_pane(
+        self,
+        mock_consume: MagicMock,
+        _mock_tmux,
+        mock_request: AsyncMock,
+        mock_my_name: AsyncMock,
+        mock_spawn_hook: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import repowire.mcp.server as mcp_server
+        from repowire.spawn_hints import Hint
+
+        mcp_server._registered = False
+        mcp_server._cached_peer_name = None
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mcp_server, "_detect_backend", lambda: "codex")
+        mock_my_name.return_value = "proj-codex"
+
+        mock_consume.return_value = Hint(circle="5", pane_id="%42")
+        mock_request.side_effect = [
+            Exception("not found"),  # GET /peers/{name} (no pane branch)
+            {"peers": []},  # GET /peers?path&backend fallback miss
+            {"display_name": "proj-codex", "peer_id": "repow-5-abc12345"},  # POST /peers
+        ]
+
+        await mcp_server._ensure_registered()
+
+        mock_spawn_hook.assert_called_once()
+        kwargs = mock_spawn_hook.call_args.kwargs
+        assert kwargs["pane_id"] == "%42"
+        assert kwargs["display_name"] == "proj-codex"
+        assert kwargs["peer_id"] == "repow-5-abc12345"
+        assert kwargs["backend"] == "codex"
+
+    @pytest.mark.asyncio
+    @patch("repowire.mcp.server._spawn_ws_hook_for_pane")
+    @patch("repowire.mcp.server._get_my_peer_name", new_callable=AsyncMock)
+    @patch("repowire.mcp.server.daemon_request", new_callable=AsyncMock)
+    @patch(
+        "repowire.mcp.server.get_tmux_info",
+        return_value={"pane_id": None, "session_name": None, "window_name": None},
+    )
+    @patch("repowire.mcp.server.consume_hint")
+    async def test_codex_eager_register_skips_ws_hook_without_pane(
+        self,
+        mock_consume: MagicMock,
+        _mock_tmux,
+        mock_request: AsyncMock,
+        mock_my_name: AsyncMock,
+        mock_spawn_hook: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No pane anchor (externally-attached codex, not /spawn) => no ws-hook."""
+        import repowire.mcp.server as mcp_server
+        from repowire.spawn_hints import Hint
+
+        mcp_server._registered = False
+        mcp_server._cached_peer_name = None
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mcp_server, "_detect_backend", lambda: "codex")
+        mock_my_name.return_value = "proj-codex"
+
+        mock_consume.return_value = Hint(circle="5", pane_id=None)
+        mock_request.side_effect = [
+            Exception("not found"),
+            {"peers": []},
+            {"display_name": "proj-codex", "peer_id": "repow-5-abc12345"},
+        ]
+
+        await mcp_server._ensure_registered()
+
+        mock_spawn_hook.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("repowire.mcp.server._spawn_ws_hook_for_pane")
+    @patch("repowire.mcp.server._get_my_peer_name", new_callable=AsyncMock)
+    @patch("repowire.mcp.server.daemon_request", new_callable=AsyncMock)
+    @patch(
+        "repowire.mcp.server.get_tmux_info",
+        return_value={"pane_id": None, "session_name": None, "window_name": None},
+    )
+    @patch("repowire.mcp.server.consume_hint")
+    async def test_non_codex_backend_does_not_spawn_ws_hook(
+        self,
+        mock_consume: MagicMock,
+        _mock_tmux,
+        mock_request: AsyncMock,
+        mock_my_name: AsyncMock,
+        mock_spawn_hook: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Claude/Gemini already get ws-hook via SessionStart; MCP must not double-spawn."""
+        import repowire.mcp.server as mcp_server
+        from repowire.spawn_hints import Hint
+
+        mcp_server._registered = False
+        mcp_server._cached_peer_name = None
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mcp_server, "_detect_backend", lambda: "claude-code")
+        mock_my_name.return_value = "proj-claude-code"
+
+        mock_consume.return_value = Hint(circle="5", pane_id="%42")
+        mock_request.side_effect = [
+            Exception("not found"),
+            {"peers": []},
+            {"display_name": "proj-claude-code", "peer_id": "repow-5-abc12345"},
+        ]
+
+        await mcp_server._ensure_registered()
+
+        mock_spawn_hook.assert_not_called()

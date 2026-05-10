@@ -84,8 +84,10 @@ def spawn_peer(config: SpawnConfig) -> SpawnResult:
         raise ValueError(f"Unknown agent type: {config.backend}")
 
     # Drop a hint so runtimes that strip tmux env (codex) can still discover
-    # the requested circle when their MCP/hook subprocess registers.
-    write_hint(config.path, config.backend.value, config.circle)
+    # the requested circle and tmux pane when their MCP/hook subprocess
+    # registers. pane_id is the anchor that lets the codex MCP eager-register
+    # spawn its websocket_hook before SessionStart fires.
+    write_hint(config.path, config.backend.value, config.circle, pane_id=pane.id)
 
     pane.send_keys(cmd, enter=True)
 

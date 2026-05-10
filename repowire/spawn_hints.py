@@ -21,11 +21,20 @@ import json
 import logging
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 from repowire.config.models import CACHE_DIR
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Hint:
+    """Spawn intent recovered for a (path, backend) pair."""
+
+    circle: str
+    pane_id: str | None = None
 
 # Hints older than this are ignored and treated as garbage. Spawn → MCP boot
 # → eager register usually completes within a few seconds; 5 minutes is
@@ -48,16 +57,21 @@ def _hint_path(path: str, backend: str) -> Path:
     return _hints_dir() / f"{_hint_key(path, backend)}.json"
 
 
-def write_hint(path: str, backend: str, circle: str) -> None:
+def write_hint(
+    path: str, backend: str, circle: str, pane_id: str | None = None,
+) -> None:
     """Record spawn intent so a peer registering from this path+backend can
-    discover its requested circle.
+    discover its requested circle and (when the runtime strips tmux env)
+    its tmux pane.
     """
-    payload = {
+    payload: dict = {
         "path": str(Path(path).resolve()),
         "backend": backend,
         "circle": circle,
         "ts": time.time(),
     }
+    if pane_id:
+        payload["pane_id"] = pane_id
     target = _hint_path(path, backend)
     try:
         target.write_text(json.dumps(payload))
@@ -65,11 +79,12 @@ def write_hint(path: str, backend: str, circle: str) -> None:
         logger.warning("spawn_hints: failed to write %s: %s", target, e)
 
 
-def consume_hint(path: str, backend: str) -> str | None:
+def consume_hint(path: str, backend: str) -> Hint | None:
     """Read and delete the spawn hint for (path, backend).
 
-    Returns the requested circle, or None if no fresh hint exists. Stale
-    hints (older than HINT_TTL_SECONDS) are deleted and treated as missing.
+    Returns the recovered Hint (circle + optional pane_id), or None if no
+    fresh hint exists. Stale hints (older than HINT_TTL_SECONDS) are deleted
+    and treated as missing.
     """
     target = _hint_path(path, backend)
     try:
@@ -97,4 +112,5 @@ def consume_hint(path: str, backend: str) -> str | None:
 
     if age > HINT_TTL_SECONDS:
         return None
-    return circle
+    pane_id = data.get("pane_id") if isinstance(data.get("pane_id"), str) else None
+    return Hint(circle=circle, pane_id=pane_id)

@@ -222,9 +222,10 @@ def main(backend: str = "claude-code") -> int:
         # Register peer via HTTP -- daemon assigns peer_id and display_name.
         # Codex strips tmux env from hook subprocesses, so fall back to the
         # spawn hint before defaulting.
+        hint = consume_hint(cwd, backend)
         circle = (
             tmux_info["session_name"]
-            or consume_hint(cwd, backend)
+            or (hint.circle if hint else None)
             or "default"
         )
         metadata = {"project": folder_name}
