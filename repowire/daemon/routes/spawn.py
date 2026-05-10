@@ -11,7 +11,17 @@ from repowire.config.models import AgentType
 from repowire.daemon.auth import require_auth
 from repowire.daemon.deps import get_config, get_peer_registry
 from repowire.daemon.peer_registry import PeerRegistry
-from repowire.spawn import SpawnConfig, SpawnResult, kill_peer, spawn_peer
+from repowire.spawn import AGENT_COMMANDS, SpawnConfig, SpawnResult, kill_peer, spawn_peer
+
+_COMMAND_TO_BACKEND: dict[str, AgentType] = {
+    cmd: backend for backend, cmd in AGENT_COMMANDS.items()
+}
+
+
+def _backend_from_command(command: str) -> AgentType:
+    """Derive AgentType from the first token of the command string."""
+    head = command.split(None, 1)[0] if command else ""
+    return _COMMAND_TO_BACKEND.get(head, AgentType.CLAUDE_CODE)
 
 router = APIRouter(tags=["spawn"])
 
@@ -133,7 +143,7 @@ async def spawn(
             SpawnConfig(
                 path=str(Path(request.path).expanduser().resolve()),
                 circle=request.circle,
-                backend=AgentType.CLAUDE_CODE,  # informational only
+                backend=_backend_from_command(request.command),
                 command=request.command,
             )
         )

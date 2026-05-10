@@ -452,4 +452,12 @@ def create_mcp_server() -> FastMCP:
 async def run_mcp_server() -> None:
     """Run the MCP server."""
     mcp = create_mcp_server()
+    # Eager-register at startup so peers whose SessionStart hook fires lazily
+    # (codex: only on first user prompt) appear in the daemon registry as soon
+    # as their MCP subprocess is alive. Idempotent for runtimes whose hook
+    # already ran -- _ensure_registered short-circuits on a fast GET.
+    try:
+        await _ensure_registered()
+    except Exception as e:
+        logger.debug("Eager MCP registration failed (non-fatal): %s", e)
     await mcp.run_stdio_async()

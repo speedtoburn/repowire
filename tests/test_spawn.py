@@ -632,3 +632,93 @@ class TestMcpRegistration:
         post_calls = [c for c in mock_request.await_args_list if c.args[0] == "POST"]
         assert post_calls == []
         assert mcp_server._cached_peer_name == "repowire-codex"
+
+
+class TestSpawnRouteBackendFromCommand:
+    """The spawn HTTP route derives the AgentType from the command string."""
+
+    def test_codex_command_resolves_to_codex_backend(self) -> None:
+        from repowire.config.models import AgentType
+        from repowire.daemon.routes.spawn import _backend_from_command
+
+        assert _backend_from_command("codex") is AgentType.CODEX
+
+    def test_command_with_flags_resolves_on_first_token(self) -> None:
+        from repowire.config.models import AgentType
+        from repowire.daemon.routes.spawn import _backend_from_command
+
+        assert (
+            _backend_from_command("claude --dangerously-skip-permissions")
+            is AgentType.CLAUDE_CODE
+        )
+        assert _backend_from_command("gemini --yolo") is AgentType.GEMINI
+
+    def test_unknown_command_falls_back_to_claude_code(self) -> None:
+        from repowire.config.models import AgentType
+        from repowire.daemon.routes.spawn import _backend_from_command
+
+        assert _backend_from_command("some-other-cli") is AgentType.CLAUDE_CODE
+
+    def test_empty_command_falls_back_to_claude_code(self) -> None:
+        from repowire.config.models import AgentType
+        from repowire.daemon.routes.spawn import _backend_from_command
+
+        assert _backend_from_command("") is AgentType.CLAUDE_CODE
+
+
+class TestEagerMcpRegistration:
+    """run_mcp_server eagerly registers the peer before entering the stdio loop.
+
+    This warms up runtimes (codex) whose SessionStart hook fires lazily on
+    first user prompt, so the peer appears in the daemon registry as soon as
+    its MCP subprocess is alive.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_mcp_server_calls_ensure_registered_before_stdio(self) -> None:
+        import repowire.mcp.server as mcp_server
+
+        order: list[str] = []
+
+        async def fake_ensure() -> None:
+            order.append("ensure")
+
+        mock_mcp = MagicMock()
+
+        async def fake_stdio() -> None:
+            order.append("stdio")
+
+        mock_mcp.run_stdio_async = fake_stdio
+
+        with (
+            patch.object(mcp_server, "_ensure_registered", fake_ensure),
+            patch.object(mcp_server, "create_mcp_server", return_value=mock_mcp),
+        ):
+            await mcp_server.run_mcp_server()
+
+        assert order == ["ensure", "stdio"]
+
+    @pytest.mark.asyncio
+    async def test_run_mcp_server_proceeds_when_eager_registration_fails(self) -> None:
+        """Daemon downtime at MCP startup must not block the stdio loop."""
+        import repowire.mcp.server as mcp_server
+
+        async def failing_ensure() -> None:
+            raise RuntimeError("daemon down")
+
+        stdio_called = False
+        mock_mcp = MagicMock()
+
+        async def fake_stdio() -> None:
+            nonlocal stdio_called
+            stdio_called = True
+
+        mock_mcp.run_stdio_async = fake_stdio
+
+        with (
+            patch.object(mcp_server, "_ensure_registered", failing_ensure),
+            patch.object(mcp_server, "create_mcp_server", return_value=mock_mcp),
+        ):
+            await mcp_server.run_mcp_server()
+
+        assert stdio_called is True
