@@ -126,19 +126,41 @@ class TestFormatReminderBlock:
     def test_empty(self):
         assert format_reminder_block([]) == ""
 
-    def test_single(self):
+    def test_single_includes_snippet(self):
+        """Single ask: cid + asker + body snippet for compaction recovery."""
         block = format_reminder_block([{
             "correlation_id": "ask-x", "from_peer": "alice", "text": "what's the status?",
         }])
         assert "ask-x" in block
         assert "@alice" in block
-        assert "what's the status?" in block
+        assert "what's the status?" in block  # body included as snippet
         assert "ack(corr_id)" in block
 
-    def test_preserves_full_text(self):
-        """Reminder carries full ask text — no truncation."""
-        long_text = "x" * 500
+    def test_multiple_lists_each(self):
+        block = format_reminder_block([
+            {"correlation_id": "ask-x", "from_peer": "alice", "text": "first"},
+            {"correlation_id": "ask-y", "from_peer": "bob", "text": "second"},
+        ])
+        assert "ask-x" in block
+        assert "ask-y" in block
+        assert "@alice" in block
+        assert "@bob" in block
+        assert "first" in block
+        assert "second" in block
+
+    def test_truncates_long_body(self):
+        """Per-ask body snippet capped to bound block size under verbose asks."""
+        long_text = "x" * 5000
         block = format_reminder_block([{
             "correlation_id": "ask-x", "from_peer": "a", "text": long_text,
         }])
-        assert long_text in block
+        # Truncated, not 5000 chars
+        assert len(block) < 400
+        assert "…" in block
+
+    def test_handles_empty_text(self):
+        block = format_reminder_block([{
+            "correlation_id": "ask-x", "from_peer": "a", "text": "",
+        }])
+        assert "ask-x" in block
+        assert "@a" in block

@@ -92,18 +92,30 @@ def fetch_and_filter_pending(
     return pending
 
 
+_BODY_SNIPPET_CHARS = 150
+
+
 def format_reminder_block(asks: list[dict[str, Any]]) -> str:
-    """Format a context-injection block listing un-acked asks."""
+    """Compact reminder: cid + asker + a snippet of body per ask.
+
+    The original ask was injected into the terminal by ws-hook at delivery
+    time, so the full body is usually still in the agent's transcript. The
+    snippet is a fallback for cases where the body fell out of context
+    (compaction, missed paste, restart) — enough to recall the ask without
+    the wall-of-text problem of re-pasting the full body every Stop cycle.
+    """
     if not asks:
         return ""
     lines = [
-        "[repowire] You have open asks awaiting your response. Each needs "
-        "ack(corr_id) to close (bare = seen-no-action), ack(corr_id, message) "
-        "to reply, or ask(reply_to=corr_id, ...) to chain a follow-up.",
+        f"[repowire] {len(asks)} open ask(s). Handle each: ack(corr_id) bare "
+        "if no reply needed, ack(corr_id, message) to reply.",
     ]
-    for ask in asks:
-        cid = ask.get("correlation_id", "")
-        from_peer = ask.get("from_peer", "?")
-        text = (ask.get("text") or "").strip()
-        lines.append(f"  - @{from_peer} [ask #{cid}]: {text}")
+    for a in asks:
+        cid = a.get("correlation_id", "?")
+        from_peer = a.get("from_peer", "?")
+        body = (a.get("text") or "").strip().replace("\n", " ")
+        if len(body) > _BODY_SNIPPET_CHARS:
+            body = body[: _BODY_SNIPPET_CHARS - 1] + "…"
+        head = f"  - #{cid} from @{from_peer}"
+        lines.append(f"{head}: {body}" if body else head)
     return "\n".join(lines)
