@@ -10,6 +10,7 @@ import libtmux
 from libtmux.exc import LibTmuxException, ObjectDoesNotExist
 
 from repowire.config.models import AgentType
+from repowire.spawn_hints import write_hint
 
 # Default commands for each agent type
 AGENT_COMMANDS: dict[AgentType, str] = {
@@ -81,6 +82,10 @@ def spawn_peer(config: SpawnConfig) -> SpawnResult:
         cmd = AGENT_COMMANDS[config.backend]
     else:
         raise ValueError(f"Unknown agent type: {config.backend}")
+
+    # Drop a hint so runtimes that strip tmux env (codex) can still discover
+    # the requested circle when their MCP/hook subprocess registers.
+    write_hint(config.path, config.backend.value, config.circle)
 
     pane.send_keys(cmd, enter=True)
 

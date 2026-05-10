@@ -26,6 +26,7 @@ from repowire.hooks.utils import (
     ws_hook_lock_path,
     ws_hook_pid_path,
 )
+from repowire.spawn_hints import consume_hint
 
 
 def _register_peer_http(
@@ -219,7 +220,13 @@ def main(backend: str = "claude-code") -> int:
         clear_pane_runtime_state(pane_id)
 
         # Register peer via HTTP -- daemon assigns peer_id and display_name.
-        circle = tmux_info["session_name"] or "default"
+        # Codex strips tmux env from hook subprocesses, so fall back to the
+        # spawn hint before defaulting.
+        circle = (
+            tmux_info["session_name"]
+            or consume_hint(cwd, backend)
+            or "default"
+        )
         metadata = {"project": folder_name}
         peer_id, display_name = _register_peer_http(
             cwd,

@@ -15,6 +15,7 @@ from repowire.config.models import DEFAULT_DAEMON_URL
 from repowire.hooks._tmux import get_pane_id, get_tmux_info
 from repowire.hooks.utils import get_display_name, read_pane_runtime_metadata
 from repowire.protocol.errors import DaemonConnectionError, DaemonHTTPError, DaemonTimeoutError
+from repowire.spawn_hints import consume_hint
 
 logger = logging.getLogger(__name__)
 
@@ -173,11 +174,16 @@ async def _ensure_registered(*, strict: bool = False) -> None:
     except (DaemonConnectionError, DaemonHTTPError, DaemonTimeoutError) as e:
         logger.debug("Path+backend peer lookup failed: %s", e)
 
+    # Tmux env is stripped by codex's MCP sandbox, so session_name is None
+    # there. Fall back to the spawn hint dropped by the daemon's /spawn route
+    # before defaulting to "default".
+    circle = tmux_info["session_name"] or consume_hint(str(cwd), backend) or "default"
+
     try:
         body: dict = {
             "name": cwd.name or "root",
             "path": str(cwd),
-            "circle": tmux_info["session_name"] or "default",
+            "circle": circle,
             "backend": backend,
         }
         if pane_id:

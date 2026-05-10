@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from repowire.config.models import AgentType
 from repowire.spawn import (
     SpawnConfig,
     SpawnResult,
@@ -169,6 +170,11 @@ class TestGetOrCreateSession:
 class TestSpawnPeer:
     """Tests for spawn_peer function."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_spawn_hints(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Redirect spawn-hint writes into a temp dir so tests don't leak files."""
+        monkeypatch.setattr("repowire.spawn_hints.CACHE_DIR", tmp_path)
+
     @patch("repowire.spawn._get_or_create_session")
     @patch("repowire.spawn.libtmux.Server")
     def test_spawn_peer_creates_tmux_window(
@@ -186,7 +192,7 @@ class TestSpawnPeer:
         mock_session.new_window.return_value = mock_window
         mock_get_session.return_value = mock_session
 
-        config = SpawnConfig(path="/tmp/test", circle="dev", backend="claude-code")
+        config = SpawnConfig(path="/tmp/test", circle="dev", backend=AgentType.CLAUDE_CODE)
         result = spawn_peer(config)
 
         assert result.display_name == "test"
@@ -213,7 +219,7 @@ class TestSpawnPeer:
         config = SpawnConfig(
             path="/tmp/test",
             circle="dev",
-            backend="claude-code",
+            backend=AgentType.CLAUDE_CODE,
             command="claude --model opus",
         )
         spawn_peer(config)
@@ -237,7 +243,7 @@ class TestSpawnPeer:
         mock_session.new_window.return_value = mock_window
         mock_get_session.return_value = mock_session
 
-        config = SpawnConfig(path="/tmp/test", circle="dev", backend="opencode")
+        config = SpawnConfig(path="/tmp/test", circle="dev", backend=AgentType.OPENCODE)
         spawn_peer(config)
 
         mock_pane.send_keys.assert_called_once_with("opencode", enter=True)
@@ -326,7 +332,7 @@ class TestSpawnPeer:
         mock_session.new_window.return_value = mock_window
         mock_get_session.return_value = mock_session
 
-        config = SpawnConfig(path="/tmp/test", circle="dev", backend="claude-code")
+        config = SpawnConfig(path="/tmp/test", circle="dev", backend=AgentType.CLAUDE_CODE)
         result = spawn_peer(config)
 
         assert result.display_name == "test-2"
