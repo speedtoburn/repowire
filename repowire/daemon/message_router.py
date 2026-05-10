@@ -100,13 +100,10 @@ class MessageRouter:
         to_peer_name: str,
         text: str,
     ) -> None:
-        """Send notification (fire-and-forget).
+        """Send a plain FYI notification (fire-and-forget, no lifecycle).
 
-        Args:
-            from_peer: Display name of sender
-            to_session_id: Session ID of recipient
-            to_peer_name: Display name of recipient (for logging)
-            text: Notification text
+        Wire shape: {type: notify, from_peer, text}. Use send_ask for
+        ask-lifecycle messages.
 
         Raises:
             TransportError: If send fails
@@ -116,9 +113,37 @@ class MessageRouter:
             "from_peer": from_peer,
             "text": text,
         }
-
         await self._transport.send(to_session_id, message)
         logger.info(f"Notification sent: {from_peer} -> {to_peer_name}")
+
+    async def send_ask(
+        self,
+        from_peer: str,
+        to_session_id: str,
+        to_peer_name: str,
+        correlation_id: str,
+        text: str,
+        reply_to: str | None = None,
+    ) -> None:
+        """Send a first-class ask wire message.
+
+        Wire shape: {type: ask, correlation_id, from_peer, text, reply_to?}.
+        The receiving transport must dispatch type=ask explicitly and POST
+        /asks/{cid}/picked_up after presenting the message to the agent.
+
+        Raises:
+            TransportError: If send fails
+        """
+        message: dict[str, Any] = {
+            "type": "ask",
+            "correlation_id": correlation_id,
+            "from_peer": from_peer,
+            "text": text,
+        }
+        if reply_to is not None:
+            message["reply_to"] = reply_to
+        await self._transport.send(to_session_id, message)
+        logger.info(f"Ask sent: {from_peer} -> {to_peer_name} ({correlation_id[:8]})")
 
     async def send_broadcast_to(
         self,

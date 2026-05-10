@@ -25,6 +25,7 @@ from repowire.config.models import DEFAULT_QUERY_TIMEOUT, AgentType, Config
 from repowire.protocol.peers import Peer, PeerRole, PeerStatus
 
 if TYPE_CHECKING:
+    from repowire.daemon.ask_tracker import AskTracker
     from repowire.daemon.message_router import MessageRouter
     from repowire.daemon.query_tracker import QueryTracker
     from repowire.daemon.websocket_transport import WebSocketTransport
@@ -74,11 +75,13 @@ class PeerRegistry:
         query_tracker: QueryTracker | None = None,
         transport: WebSocketTransport | None = None,
         persistence_path: Path | None = None,
+        ask_tracker: AskTracker | None = None,
     ) -> None:
         self._config = config
         self._router = message_router
         self._query_tracker = query_tracker
         self._transport = transport
+        self._ask_tracker = ask_tracker
 
         # Peer registry: peer_id -> Peer (single source of truth)
         self._peers: dict[str, Peer] = {}
@@ -620,7 +623,7 @@ class PeerRegistry:
         formatted_query = (
             f"[Repowire Query from @{from_peer}]\n"
             f"{text}\n\n"
-            f"IMPORTANT: Respond directly in your message. Do NOT use ask_peer() to reply - "
+            f"IMPORTANT: Respond directly in your message. Do NOT use ask() to reply - "
             f"your response is automatically captured and returned to {from_peer}."
         )
 
@@ -719,6 +722,64 @@ class PeerRegistry:
             to_session_id=peer_id,
             to_peer_name=peer_name,
             text=text,
+        )
+
+    async def deliver_ask(
+        self,
+        from_peer: str,
+        to_peer: str,
+        text: str,
+        correlation_id: str,
+        reply_to: str | None = None,
+        bypass_circle: bool = False,
+        circle: str | None = None,
+    ) -> None:
+        """Inject an ask to a peer as a first-class type=ask wire message.
+
+        BUSY recipients get the ask buffered and drained on idle. Pickup is
+        always the recipient transport's job — never daemon-side — so this
+        method only writes the wire frame.
+        """
+        async with self._lock:
+            peer = self._lookup_peer_unlocked(to_peer, circle=circle)
+            if not peer:
+                raise ValueError(f"Unknown peer: {to_peer}")
+            from_obj = self._resolve_from_peer_unlocked(from_peer, peer, bypass_circle)
+            peer_id = peer.peer_id
+            peer_name = peer.display_name
+            from_peer_id = from_obj.peer_id if from_obj else None
+            queued = self._enqueue_if_busy_unlocked(
+                peer,
+                {
+                    "kind": "ask",
+                    "from_peer": from_peer,
+                    "text": text,
+                    "correlation_id": correlation_id,
+                    "reply_to": reply_to,
+                },
+            )
+
+        self.add_event(
+            "ask",
+            {
+                "from": from_peer, "to": to_peer, "text": text,
+                "from_peer_id": from_peer_id, "to_peer_id": peer_id,
+                "correlation_id": correlation_id,
+                "reply_to": reply_to,
+                "queued": queued,
+            },
+        )
+
+        if queued:
+            return
+
+        await self._router.send_ask(
+            from_peer=from_peer,
+            to_session_id=peer_id,
+            to_peer_name=peer_name,
+            correlation_id=correlation_id,
+            text=text,
+            reply_to=reply_to,
         )
 
     async def broadcast(
@@ -863,6 +924,17 @@ class PeerRegistry:
                         to_session_id=peer_id,
                         to_peer_name=peer_name,
                         text=msg["text"],
+                    )
+                elif msg["kind"] == "ask":
+                    # Pickup remains the recipient transport's job; flushing
+                    # only writes the wire frame.
+                    await self._router.send_ask(
+                        from_peer=msg["from_peer"],
+                        to_session_id=peer_id,
+                        to_peer_name=peer_name,
+                        correlation_id=msg["correlation_id"],
+                        text=msg["text"],
+                        reply_to=msg.get("reply_to"),
                     )
                 elif msg["kind"] == "broadcast":
                     # The original broadcast fanout already ran for online
@@ -1163,6 +1235,9 @@ class PeerRegistry:
             if stale:
                 self._mappings_dirty = True
                 logger.info("evicted %d stale offline peers", len(stale))
+        if stale and self._ask_tracker is not None:
+            for pid in stale:
+                await self._ask_tracker.forget_peer(pid)
         return len(stale)
 
     async def active_repair(self) -> None:

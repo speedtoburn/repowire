@@ -46,13 +46,13 @@ def extract_last_turn_pair(transcript_path: Path) -> tuple[str | None, str | Non
     return last_user, (last_assistant if last_assistant_had_text else None)
 
 
-def extract_last_turn_tool_calls(transcript_path: Path) -> list[dict[str, str]]:
-    """Extract tool calls from the last assistant turn.
+def _iter_last_turn_tool_uses(transcript_path: Path) -> list[dict[str, Any]]:
+    """Return raw tool_use items from the last turn, chronological order.
 
-    Reads the transcript backwards from the last assistant message,
-    collecting tool_use entries until the previous user message.
-
-    Returns list of {"name": "...", "input": "one-line summary"}.
+    Handles both Claude shape (`{type:assistant,message:{content:[tool_use]}}`)
+    and Codex shape (`{type:response_item,payload:{type:function_call,name,arguments}}`).
+    Each entry is yielded as a normalized `{type:tool_use, name, input}` dict
+    where `input` is a parsed dict (Codex `arguments` are JSON-decoded).
     """
     if not transcript_path.exists():
         return []
@@ -68,13 +68,32 @@ def extract_last_turn_tool_calls(transcript_path: Path) -> list[dict[str, str]]:
             except json.JSONDecodeError:
                 continue
 
-    # Walk backwards: collect tool_use from assistant entries until we hit a real user message
-    tool_calls: list[dict[str, str]] = []
+    if not entries:
+        return []
+
+    if _looks_like_codex(entries):
+        return _walk_codex(entries)
+    return _walk_claude(entries)
+
+
+def _looks_like_codex(entries: list[dict[str, Any]]) -> bool:
+    """Heuristic: codex transcripts have response_item entries; Claude has assistant/user."""
+    for entry in entries:
+        entry_type = entry.get("type")
+        if entry_type == "response_item":
+            return True
+        if entry_type in ("assistant", "user"):
+            return False
+    return False
+
+
+def _walk_claude(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Backward walk through Claude-style transcript for last-turn tool_uses."""
+    items: list[dict[str, Any]] = []
     found_assistant = False
     for entry in reversed(entries):
         entry_type = entry.get("type")
         if entry_type == "user" and found_assistant:
-            # Skip tool_result entries (they have type=user but aren't real user messages)
             content = entry.get("message", {}).get("content", [])
             is_tool_result = isinstance(content, list) and all(
                 isinstance(c, dict) and c.get("type") == "tool_result" for c in content
@@ -90,13 +109,77 @@ def extract_last_turn_tool_calls(transcript_path: Path) -> list[dict[str, str]]:
             continue
         for item in content:
             if isinstance(item, dict) and item.get("type") == "tool_use":
-                name = item.get("name", "unknown")
-                tool_input = item.get("input", {})
-                summary = _summarize_tool_input(name, tool_input)
-                tool_calls.append({"name": name, "input": summary})
+                items.append(item)
+    items.reverse()
+    return items
 
-    tool_calls.reverse()  # chronological order
-    return tool_calls
+
+def _walk_codex(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Backward walk through Codex-style transcript for last-turn function_calls.
+
+    Codex entries are flat `response_item`s. The turn boundary is the most
+    recent user message — Codex represents this as either:
+      - {payload: {type: "message", role: "user", ...}}        (real shape)
+      - {payload: {type: "user_message" | "user_input", ...}}  (variant)
+    We collect function_calls back to that boundary, ignoring intervening
+    assistant messages and tool outputs.
+    """
+    items: list[dict[str, Any]] = []
+    for entry in reversed(entries):
+        if entry.get("type") != "response_item":
+            continue
+        payload = entry.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        payload_type = payload.get("type")
+        if payload_type in ("user_message", "user_input"):
+            break
+        if payload_type == "message" and payload.get("role") == "user":
+            break
+        if payload_type != "function_call":
+            continue
+        name = payload.get("name", "unknown")
+        args_raw = payload.get("arguments", {})
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
+            args = {}
+        items.append({"type": "tool_use", "name": name, "input": args})
+    items.reverse()
+    return items
+
+
+def extract_last_turn_tool_calls(transcript_path: Path) -> list[dict[str, str]]:
+    """Tool calls from the last assistant turn, summarized for chat display.
+
+    Returns list of {"name": "...", "input": "one-line summary"}.
+    """
+    return [
+        {
+            "name": item.get("name", "unknown"),
+            "input": _summarize_tool_input(
+                item.get("name", "unknown"), item.get("input", {}),
+            ),
+        }
+        for item in _iter_last_turn_tool_uses(transcript_path)
+    ]
+
+
+def extract_last_turn_raw_tool_calls(transcript_path: Path) -> list[dict[str, Any]]:
+    """Tool calls from the last assistant turn with raw, unsummarized inputs.
+
+    Used by the ask-ack reminder logic to inspect ack/ask arguments.
+    Returns list of {"name": str, "input": dict | Any}.
+    """
+    return [
+        {"name": item.get("name", "unknown"), "input": item.get("input", {})}
+        for item in _iter_last_turn_tool_uses(transcript_path)
+    ]
 
 
 def _summarize_tool_input(name: str, tool_input: Any) -> str:

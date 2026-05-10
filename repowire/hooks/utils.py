@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
 import json
 import os
 import sys
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import httpx
@@ -49,9 +51,48 @@ def get_display_name() -> str:
     return Path.cwd().name
 
 
-def pending_cid_path(pane_id: str) -> Path:
-    """Path to the pending correlation_id file for a pane."""
-    return pane_logs_dir() / f"pending-{get_pane_file(pane_id)}.json"
+def pending_query_cid_path(pane_id: str | None) -> Path:
+    """Path to the pending /query correlation_id file for a pane.
+
+    Single-purpose: only legacy /query cids land here. Ask cids are handled
+    transport-side (POST /asks/{cid}/picked_up) and never use a FIFO.
+    """
+    return pane_logs_dir() / f"pending-query-{get_pane_file(pane_id)}.json"
+
+
+@contextmanager
+def _locked_query_cids(pane_id: str) -> Iterator[list[str]]:
+    """Yield the parsed pending-query-cid list under flock; persist on clean exit."""
+    path = pending_query_cid_path(pane_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            try:
+                pending = json.loads(path.read_text()) if path.exists() else []
+                if not isinstance(pending, list):
+                    pending = []
+            except (json.JSONDecodeError, OSError):
+                pending = []
+            yield pending
+            path.write_text(json.dumps(pending))
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def push_query_cid(pane_id: str, correlation_id: str) -> None:
+    """Append a /query correlation_id to the per-pane FIFO under flock."""
+    with _locked_query_cids(pane_id) as pending:
+        pending.append(correlation_id)
+
+
+def pop_query_cid(pane_id: str) -> str | None:
+    """Pop the oldest /query correlation_id from the per-pane FIFO under flock."""
+    with _locked_query_cids(pane_id) as pending:
+        if not pending:
+            return None
+        return pending.pop(0)
 
 
 def pane_logs_dir() -> Path:
@@ -111,12 +152,47 @@ def write_pane_runtime_metadata(pane_id: str | None, metadata: dict) -> None:
         ws_hook_legacy_cwd_path(pane_id).write_text(str(cwd))
 
 
+def reminder_buffer_path(pane_id: str | None) -> Path:
+    """Path to the pane's pending reminder text file.
+
+    The Stop hook writes ask-ack reminder text here when there are pending
+    asks past the grace window. The next UserPromptSubmit (or
+    Notification/idle_prompt) hook reads it, injects, and deletes.
+    """
+    return pane_logs_dir() / f"reminder-{get_pane_file(pane_id)}.txt"
+
+
+def consume_reminder_buffer(pane_id: str | None) -> str | None:
+    """Read and remove the pending reminder for a pane. Returns None if empty."""
+    if not pane_id:
+        return None
+    path = reminder_buffer_path(pane_id)
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    with suppress(OSError):
+        path.unlink()
+    return text or None
+
+
+def write_reminder_buffer(pane_id: str | None, text: str) -> None:
+    """Persist reminder text for next-prompt injection. Skips if empty."""
+    if not pane_id or not text:
+        return
+    path = reminder_buffer_path(pane_id)
+    try:
+        path.write_text(text)
+    except OSError as e:
+        print(f"repowire: failed to write reminder buffer: {e}", file=sys.stderr)
+
+
 def clear_pending_cids(pane_id: str | None) -> None:
-    """Remove any queued correlation IDs for a pane."""
+    """Remove any queued /query correlation IDs for a pane."""
     if not pane_id:
         return
 
-    pending_path = pending_cid_path(pane_id)
+    pending_path = pending_query_cid_path(pane_id)
     lock_path = pending_path.with_suffix(pending_path.suffix + ".lock")
     for path in (pending_path, lock_path):
         with suppress(OSError):
@@ -133,6 +209,7 @@ def clear_pane_runtime_state(pane_id: str | None) -> None:
         ws_hook_pid_path(pane_id),
         ws_hook_meta_path(pane_id),
         ws_hook_legacy_cwd_path(pane_id),
+        reminder_buffer_path(pane_id),
     ):
         with suppress(OSError):
             path.unlink()

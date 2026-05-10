@@ -283,6 +283,26 @@ async function handleDaemonMessage(conn: PeerConn, data: Record<string, unknown>
     const fromPeer = data.from_peer as string
     const text = data.text as string
     await handleIncomingQuery(conn, correlationId, fromPeer, text)
+  } else if (msgType === "ask") {
+    // First-class ask: surface with [ask #cid] framing so the agent can
+    // ack via the ack tool. POST pickup ONLY if softInject succeeded —
+    // otherwise we'd be telling the daemon "delivered" without the agent
+    // having seen anything.
+    const correlationId = data.correlation_id as string
+    const fromPeer = (data.from_peer as string) || "unknown"
+    const text = data.text as string
+    const delivered = await softInject(
+      `@${fromPeer} → ${conn.peerName} [ask #${correlationId}]: ${text}`,
+    )
+    if (delivered && correlationId) {
+      try {
+        await daemon(`/asks/${encodeURIComponent(correlationId)}/picked_up`, {
+          correlation_id: correlationId,
+        })
+      } catch (e) {
+        console.debug("[repowire] failed to post ask pickup:", e)
+      }
+    }
   } else if (msgType === "ping") {
     if (conn.ws?.readyState === WebSocket.OPEN) {
       conn.ws.send(JSON.stringify({ type: "pong", pane_alive: true }))
@@ -300,10 +320,10 @@ async function handleDaemonMessage(conn: PeerConn, data: Record<string, unknown>
   }
 }
 
-async function softInject(text: string) {
+async function softInject(text: string): Promise<boolean> {
   if (!serverUrl) {
     console.warn("[repowire] No serverUrl available for soft inject")
-    return
+    return false
   }
   try {
     const res = await fetch(`${serverUrl}tui/publish`, {
@@ -314,9 +334,14 @@ async function softInject(text: string) {
         properties: { text: text + " " },
       }),
     })
-    if (!res.ok) console.warn(`[repowire] tui.prompt.append failed: ${res.status}`)
+    if (!res.ok) {
+      console.warn(`[repowire] tui.prompt.append failed: ${res.status}`)
+      return false
+    }
+    return true
   } catch (e) {
     console.warn("[repowire] Failed to publish tui event:", e)
+    return false
   }
 }
 
@@ -673,21 +698,41 @@ export const RepowirePlugin: Plugin = async ({ client, directory, ...rest }) => 
           return rows.join("\\n")
         },
       }),
-      ask_peer: tool({
-        description: "Ask another peer a question and wait for their response",
+      ask: tool({
+        description: "Open a non-blocking ask thread with a peer. Returns a correlation_id immediately. The peer responds via ack(corr_id) (bare close) or ack(corr_id, message) (reply, delivered as a notification framed [ack #cid from @peer] message).",
         args: {
           peer_name: tool.schema.string().describe("Name of the peer to ask"),
           query: tool.schema.string().describe("The question to ask"),
+          reply_to: tool.schema.string().optional().describe("If set, closes that prior ask before opening this one"),
         },
-        async execute({ peer_name, query }, ctx) {
+        async execute({ peer_name, query, reply_to }, ctx) {
           const me = callerPeer(ctx as { sessionID?: string })
-          const result = await daemon("/query", {
+          const body: any = {
             from_peer: me.peerName,
             to_peer: peer_name,
             text: query,
-          })
+          }
+          if (reply_to) body.reply_to = reply_to
+          const result = await daemon("/ask", body)
           if (result.error) throw new Error(result.error)
-          return result.text
+          return result.correlation_id || ""
+        },
+      }),
+      ack: tool({
+        description: "Close an open ask thread. Bare close: ack(corr_id). Reply: ack(corr_id, message) -- delivered to the original asker.",
+        args: {
+          correlation_id: tool.schema.string().describe("The ask's correlation_id"),
+          message: tool.schema.string().optional().describe("Optional reply content"),
+        },
+        async execute({ correlation_id, message }, ctx) {
+          const me = callerPeer(ctx as { sessionID?: string })
+          const body: any = {
+            correlation_id,
+            from_peer: me.peerName,
+          }
+          if (message !== undefined) body.message = message
+          await daemon("/ack", body)
+          return `acked #${correlation_id}` + (message ? " with reply" : "")
         },
       }),
       notify_peer: tool({
@@ -912,8 +957,8 @@ export const RepowirePlugin: Plugin = async ({ client, directory, ...rest }) => 
 Other peers online:
 ${peerList}
 
-IMPORTANT: When asked about other projects, ask the peer directly via ask_peer rather than searching locally.
-Use list_peers to refresh peer status. Use notify_peer for fire-and-forget messages.`)
+IMPORTANT: When asked about other projects, ask the peer directly via ask tool rather than searching locally. ask returns a correlation_id immediately; the peer closes the thread via ack (bare = seen, no action) or ack(message) (reply). Inbound asks arrive framed [ask #cid] -- you must ack them.
+Use list_peers to see current peer status. Use notify_peer for fire-and-forget messages.`)
       } catch (e) {
         console.debug("[repowire] Failed to fetch peer context:", e)
       }
