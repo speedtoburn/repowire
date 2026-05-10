@@ -29,6 +29,7 @@ class SpawnConfig:
     circle: str
     backend: AgentType
     command: str = ""  # Full command to run (e.g., "claude --model opus")
+    message: str | None = None  # Optional warmup intent passed to post_spawn_warmup
 
     @property
     def display_name(self) -> str:
@@ -42,6 +43,8 @@ class SpawnResult:
 
     display_name: str
     tmux_session: str  # e.g., "circle:name"
+    pane_id: str  # tmux pane id (e.g. "%42") for post-spawn warmup
+    message: str | None = None  # Echo of the warmup intent (None = use default)
 
 
 def spawn_peer(config: SpawnConfig) -> SpawnResult:
@@ -84,10 +87,8 @@ def spawn_peer(config: SpawnConfig) -> SpawnResult:
         raise ValueError(f"Unknown agent type: {config.backend}")
 
     # Drop a hint so runtimes that strip tmux env (codex) can still discover
-    # the requested circle and tmux pane when their MCP/hook subprocess
-    # registers. pane_id is the anchor that lets the codex MCP eager-register
-    # spawn its websocket_hook before SessionStart fires.
-    write_hint(config.path, config.backend.value, config.circle, pane_id=pane.id)
+    # the requested circle when their MCP/hook subprocess registers.
+    write_hint(config.path, config.backend.value, config.circle)
 
     pane.send_keys(cmd, enter=True)
 
@@ -96,6 +97,8 @@ def spawn_peer(config: SpawnConfig) -> SpawnResult:
     return SpawnResult(
         display_name=window_name,
         tmux_session=tmux_session,
+        pane_id=pane.id or "",
+        message=config.message,
     )
 
 
