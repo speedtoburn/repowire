@@ -459,6 +459,7 @@ function CopyPeerName({ peer }: { peer: Peer }) {
         setTimeout(() => setCopied(false), 1500);
       }}
       title="Copy peer name"
+      aria-label="Copy peer name"
       className="hidden h-8 w-8 items-center justify-center rounded border border-border text-outline transition-colors hover:bg-surface-container-high hover:text-on-surface sm:inline-flex"
     >
       {copied ? <Check className="h-3.5 w-3.5 text-secondary" /> : <Copy className="h-3.5 w-3.5" />}

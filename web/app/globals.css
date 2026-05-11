@@ -135,12 +135,15 @@
   }
 }
 
-html,
+html {
+  font-size: 16px;
+}
+
 body {
   background: var(--ink-950);
   color: var(--fg-2);
   font-family: var(--font-body);
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.45;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -150,7 +153,7 @@ button,
 input,
 textarea,
 select {
-  font: inherit;
+  font-family: inherit;
 }
 
 button {
