@@ -40,7 +40,7 @@ export function PeerRoster({
           value={filter}
           onChange={(event) => onFilter(event.target.value)}
           placeholder="filter peers, circles, paths..."
-          className="min-w-0 flex-1 bg-transparent font-mono text-xs text-on-surface outline-none placeholder:text-outline"
+          className="min-w-0 flex-1 bg-transparent font-mono text-base text-on-surface outline-none placeholder:text-outline md:text-xs"
         />
         <span className="font-mono text-[10px] text-outline tabular-nums">{peers.length}/{allCount}</span>
       </div>

@@ -11,7 +11,7 @@ interface SpawnConfig {
   allowed_paths: string[];
 }
 
-const inputClass = "w-full rounded border border-border-faint bg-surface-container-lowest px-3 py-2 font-mono text-sm text-on-surface outline-none placeholder:text-outline focus:border-primary focus:ring-1 focus:ring-primary";
+const inputClass = "w-full rounded border border-border-faint bg-surface-container-lowest px-3 py-2 font-mono text-base text-on-surface outline-none placeholder:text-outline focus:border-primary focus:ring-1 focus:ring-primary md:text-sm";
 
 export function SpawnDialog({ apiBase, onClose, onSpawned }: { apiBase: string; onClose: () => void; onSpawned: () => void }) {
   const [config, setConfig] = useState<SpawnConfig | null>(null);

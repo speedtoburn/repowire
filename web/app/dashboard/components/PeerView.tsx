@@ -368,7 +368,7 @@ function ComposeBar({
           onKeyDown={onKeyDown}
           placeholder={`ask ${peerLabel(peer)} something...`}
           rows={1}
-          className="max-h-32 min-h-10 flex-1 resize-none rounded border border-border-faint bg-surface-container-lowest px-3 py-2.5 font-mono text-sm text-on-surface outline-none placeholder:text-outline focus:border-primary focus:ring-1 focus:ring-primary"
+          className="max-h-32 min-h-10 flex-1 resize-none rounded border border-border-faint bg-surface-container-lowest px-3 py-2.5 font-mono text-base text-on-surface outline-none placeholder:text-outline focus:border-primary focus:ring-1 focus:ring-primary md:text-sm"
         />
         <button
           onClick={submit}
